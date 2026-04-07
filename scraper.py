@@ -43,7 +43,6 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     StaleElementReferenceException,
 )
-from webdriver_manager.chrome import ChromeDriverManager
 import openpyxl
 
 import config
@@ -71,8 +70,7 @@ def make_driver() -> webdriver.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+    driver = webdriver.Chrome(service=Service(config.CHROMEDRIVER_PATH), options=options)
     driver.implicitly_wait(0)
     return driver
 
@@ -111,13 +109,12 @@ def switch_to_iframe(driver, css_selector):
 # Date parsing
 # ---------------------------------------------------------------------------
 
-def is_current_month(date_string: str) -> bool:
-    """Return True if date_string falls in the current calendar month."""
-    now = datetime.now()
+def is_same_month(date_string: str, ref_date: datetime) -> bool:
+    """Return True if date_string falls in the same calendar month as ref_date."""
     for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(date_string.strip(), fmt)
-            return dt.year == now.year and dt.month == now.month
+            return dt.year == ref_date.year and dt.month == ref_date.month
         except ValueError:
             continue
     log.warning("Could not parse date: '%s'", date_string)
@@ -250,15 +247,36 @@ def open_poliklinik_module(driver):
     ActionChains(driver).move_to_element(tile).click().perform()
     time.sleep(3)
 
-    # Log what opened so we can debug
-    tab_count = driver.execute_script("return document.querySelectorAll('a.x-tab').length")
-    iframe_count = driver.execute_script("return document.querySelectorAll('iframe').length")
-    body_classes = driver.execute_script("return document.body.className")
-    log.info("After tile click: tabs=%s iframes=%s body=%s", tab_count, iframe_count, body_classes[:80])
+    # Click the Poliklinik tab in the module toolbar — without this the panel renders empty
+    try:
+        tab = wait_clickable(driver, By.XPATH, SEL.POLIKLINIK_TAB, timeout=10)
+        tab.click()
+        log.info("Clicked Poliklinik tab.")
+        time.sleep(1)
+    except TimeoutException:
+        log.info("Poliklinik tab not found — assuming content loaded directly.")
 
     switch_to_iframe(driver, SEL.POLIKLINIK_IFRAME)
     wait_visible(driver, By.XPATH, SEL.POLIKLINIK_LOADED_LANDMARK, timeout=30)
     log.info("Poliklinik module loaded.")
+
+    # Widen date range so March patients are visible
+    driver.execute_script("""
+        try {
+            var fields = Ext.ComponentQuery.query('datefield');
+            var now = new Date();
+            var firstOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+            for (var i = 0; i < fields.length; i++) {
+                var lbl = (fields[i].fieldLabel || '').trim();
+                if (lbl.indexOf('lk Tarih') !== -1) {
+                    fields[i].setValue(firstOfLastMonth);
+                } else if (lbl === 'Son Tarih:' || lbl === 'Son Tarih') {
+                    fields[i].setValue(now);
+                }
+            }
+        } catch(e) {}
+    """)
+    log.info("Date range set: 1st of last month → today.")
 
 # ---------------------------------------------------------------------------
 # Search patient by TC
@@ -268,15 +286,26 @@ def search_patient(driver, tc: str) -> bool:
     """Enter TC and click Sorgula. Returns True if at least one row appears."""
     log.info("Searching TC: %s", tc)
 
+    # Clear via Temizle first to reset grid state
+    try:
+        temizle = driver.find_element(By.XPATH, SEL.CLEAR_SEARCH_BUTTON)
+        driver.execute_script("arguments[0].click();", temizle)
+        time.sleep(1)
+    except NoSuchElementException:
+        pass
+
     tc_input = wait_clickable(driver, By.XPATH, SEL.TC_SEARCH_INPUT)
     tc_input.clear()
+    time.sleep(0.5)
     tc_input.send_keys(tc)
+    time.sleep(0.5)
 
-    wait_clickable(driver, By.XPATH, SEL.TC_SEARCH_BUTTON).click()
+    btn = wait_clickable(driver, By.XPATH, SEL.TC_SEARCH_BUTTON)
+    driver.execute_script("arguments[0].click();", btn)
 
-    # Wait for the grid to settle: either rows appear or it stays empty.
-    # x-grid-empty is always present (initial state + no-results), so we
-    # can't use it as a signal — we just wait for rows or timeout.
+    # Wait for the grid to load — the grid shows a loading mask during search
+    time.sleep(3)  # give the slow system time to start the request
+
     try:
         WebDriverWait(driver, config.WAIT_TIMEOUT).until(
             EC.presence_of_element_located((By.XPATH, SEL.PATIENT_ROW_XPATH))
@@ -285,6 +314,8 @@ def search_patient(driver, tc: str) -> bool:
         log.info("No patient rows found for TC: %s", tc)
         return False
 
+    # Extra settle time for grid to fully render
+    time.sleep(1)
     rows = driver.find_elements(By.XPATH, SEL.PATIENT_ROW_XPATH)
     log.info("Found %d row(s) for TC: %s", len(rows), tc)
     return bool(rows)
@@ -293,46 +324,17 @@ def search_patient(driver, tc: str) -> bool:
 # Select patient row closest to transfer date
 # ---------------------------------------------------------------------------
 
-def select_patient_row_by_date(driver, transfer_dt: datetime):
+def select_patient_row(driver):
     """
-    Click the patient grid row whose visit date is closest to transfer_dt
-    and within 24 hours of it.  Falls back to the first row if the date
-    column cannot be read or no row falls within 24 hours.
+    Click the first visible patient row. Simply selects the first row to
+    open the patient — the Hasta Geçmişi popup searches all visits anyway.
     """
-    container = wait_visible(driver, By.XPATH, SEL.PATIENT_LIST_CONTAINER)
-    rows = container.find_elements(By.XPATH, SEL.PATIENT_ROW_XPATH)
+    rows = driver.find_elements(By.XPATH, SEL.PATIENT_ROW_XPATH)
     if not rows:
         raise RuntimeError("No patient rows to select.")
 
-    best_row  = None
-    best_delta = None
-
-    for row in rows:
-        date_cell = safe_find(row, By.XPATH, SEL.PATIENT_ROW_DATE_XPATH)
-        if not date_cell:
-            continue
-        date_text = date_cell.text.strip()
-        row_dt = None
-        for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-            try:
-                row_dt = datetime.strptime(date_text, fmt)
-                break
-            except ValueError:
-                continue
-        if row_dt is None:
-            continue
-        delta = abs((row_dt - transfer_dt).total_seconds())
-        if delta <= 86400 and (best_delta is None or delta < best_delta):
-            best_row   = row
-            best_delta = delta
-
-    if best_row is None:
-        log.warning("No row within 24h of transfer date %s — using first row.", transfer_dt)
-        best_row = rows[0]
-    else:
-        log.info("Selected row with delta %.0f s from transfer date.", best_delta)
-
-    best_row.click()
+    log.info("Clicking first patient row out of %d.", len(rows))
+    driver.execute_script("arguments[0].click();", rows[0])
     time.sleep(config.NAV_SETTLE_WAIT)
 
 # ---------------------------------------------------------------------------
@@ -342,8 +344,10 @@ def select_patient_row_by_date(driver, transfer_dt: datetime):
 def open_hasta_gecmisi(driver):
     """Click the Hasta Geçmişi button and wait for the popup."""
     log.info("Opening Hasta Geçmişi...")
-    wait_clickable(driver, By.XPATH, SEL.HASTA_GECMISI_BUTTON).click()
+    btn = wait_clickable(driver, By.XPATH, SEL.HASTA_GECMISI_BUTTON)
+    driver.execute_script("arguments[0].click();", btn)
     wait_visible(driver, By.XPATH, SEL.GECMIS_POPUP)
+    time.sleep(1)  # let popup fully render
     log.info("Hasta Geçmişi popup opened.")
 
 # ---------------------------------------------------------------------------
@@ -358,57 +362,130 @@ def click_tum_hastaneler(driver):
     TUM_HASTANELER_BUTTON is a relative XPath — scoped to the popup element.
     """
     log.info("Clicking Tüm Hastaneler...")
-    popup = wait_visible(driver, By.XPATH, SEL.GECMIS_POPUP)
-    btn = WebDriverWait(popup, config.WAIT_TIMEOUT).until(
-        lambda ctx: ctx.find_element(By.XPATH, SEL.TUM_HASTANELER_BUTTON)
-    )
-    btn.click()
-    # Wait a moment for the grid to reload with all-hospital data
-    time.sleep(config.NAV_SETTLE_WAIT)
+    wait_visible(driver, By.XPATH, SEL.GECMIS_POPUP)
+    time.sleep(1)  # allow popup grid to fully render before interacting
+
+    # Use ExtJS component API to toggle the checkbox — DOM click stops working
+    # after the first popup because ExtJS doesn't rebind the event handler
+    clicked = driver.execute_script("""
+        // Find the Hasta Geçmişi popup
+        var wins = Ext.ComponentQuery.query('window');
+        var popup = null;
+        for (var i = 0; i < wins.length; i++) {
+            if (wins[i].title && wins[i].title.indexOf('Hasta Ge') !== -1 && wins[i].isVisible()) {
+                popup = wins[i];
+                break;
+            }
+        }
+        if (!popup) return 'popup not found';
+
+        // Find the checkbox inside the popup via ComponentQuery
+        var cbs = popup.query('checkboxfield');
+        var cb = null;
+        for (var i = 0; i < cbs.length; i++) {
+            var lbl = cbs[i].fieldLabel || '';
+            if (lbl.indexOf('Hastaneler') !== -1) { cb = cbs[i]; break; }
+        }
+        if (!cb) return 'checkbox not found in popup (found ' + cbs.length + ' checkboxes)';
+
+        // If already checked, uncheck first to force a fresh load
+        if (cb.getValue()) {
+            cb.setValue(false);
+            cb.fireEvent('change', cb, false, true);
+        }
+
+        // Small delay handled by setTimeout, then check
+        cb.setValue(true);
+        cb.fireEvent('change', cb, true, false);
+        return 'toggled via API: ' + cb.id;
+    """)
+    log.info("Tüm Hastaneler JS result: %s", clicked)
+    time.sleep(5)  # wait for grid to reload with all-hospital data
     log.info("Tüm Hastaneler loaded.")
 
 # ---------------------------------------------------------------------------
 # Scan popup rows for Yatış
 # ---------------------------------------------------------------------------
 
-def find_yatis_in_popup(driver) -> dict:
+def find_yatis_in_popup(driver, transfer_dt: datetime) -> dict:
     """
-    Scan all rows in the Hasta Geçmişi popup.
-    Return the first row in the current month where Sevk Tipi == 'Yatış'.
+    Scan all rows in the Hasta Geçmişi popup using the ExtJS grid store.
+    Look for a row where yatisTarihi is set (indicates internment) and falls
+    in the same month as the transfer date.
     Returns {"found": bool, "birim": str, "tarih": str}.
     """
     result = {"found": False, "birim": "", "tarih": ""}
+    wait_visible(driver, By.XPATH, SEL.GECMIS_POPUP)
 
-    popup = wait_visible(driver, By.XPATH, SEL.GECMIS_POPUP)
-    rows = popup.find_elements(By.XPATH, SEL.GECMIS_ROW_XPATH)
-    log.info("Popup has %d rows.", len(rows))
+    target_month = transfer_dt.month
+    target_year  = transfer_dt.year
 
-    for row in rows:
-        try:
-            tarih_cell    = safe_find(row, By.XPATH, SEL.GECMIS_ROW_TARIH_XPATH)
-            sevk_tipi_cell = safe_find(row, By.XPATH, SEL.GECMIS_ROW_SEVK_TIPI_XPATH)
-            birim_cell    = safe_find(row, By.XPATH, SEL.GECMIS_ROW_BIRIM_XPATH)
+    data = driver.execute_script("""
+        var targetMonth = arguments[0];
+        var targetYear  = arguments[1];
 
-            if not (tarih_cell and sevk_tipi_cell and birim_cell):
-                continue
+        var wins = Ext.ComponentQuery.query('window');
+        var popup = null;
+        for (var i = 0; i < wins.length; i++) {
+            if (wins[i].title && wins[i].title.indexOf('Hasta Ge') !== -1 && wins[i].isVisible()) {
+                popup = wins[i];
+                break;
+            }
+        }
+        if (!popup) return {error: 'popup not found'};
 
-            tarih_text    = tarih_cell.text.strip()
-            sevk_tipi_text = sevk_tipi_cell.text.strip()
-            birim_text    = birim_cell.text.strip()
+        var grids = popup.query('gridpanel');
+        if (!grids.length) return {error: 'no grid in popup'};
 
-            if sevk_tipi_text != "Yatış":
-                continue                          # skip "Diğer Yatış" and others
+        var store = grids[0].getStore();
+        if (!store) return {error: 'no store'};
 
-            if not is_current_month(tarih_text):
-                continue
+        var count = store.getCount();
+        var matches = [];
+        var sevkTipiValues = {};
 
-            log.info("  Yatış found: Birim=%s | Tarih=%s", birim_text, tarih_text)
-            result = {"found": True, "birim": birim_text, "tarih": tarih_text}
-            break                                 # take the first match
+        for (var i = 0; i < count; i++) {
+            var rec = store.getAt(i);
+            var d = rec.data;
+            var st = String(d.sevkTipi || '');
+            sevkTipiValues[st] = (sevkTipiValues[st] || 0) + 1;
 
-        except StaleElementReferenceException:
-            log.warning("Stale row element — skipping.")
-            continue
+            // sevkTipi '2' = Yatış (inpatient admission)
+            if (st !== '2') continue;
+
+            // Only consider records from the tertiary center
+            var org = String(d.birimOrganizasyon || '');
+            if (org.indexOf('Ara') === -1) continue;  // must contain "Araştırma"
+
+            // Parse sevkTarihi to check month
+            var sevkStr = String(d.sevkTarihi || '');
+            var sevkDate = new Date(sevkStr);
+            if (isNaN(sevkDate.getTime())) continue;
+
+            if (sevkDate.getMonth() + 1 === targetMonth && sevkDate.getFullYear() === targetYear) {
+                matches.push({
+                    birim: d.birimAdi || '',
+                    tarih: sevkDate.toLocaleDateString('tr-TR'),
+                    org: org
+                });
+            }
+        }
+
+        return {count: count, sevkTipiValues: sevkTipiValues, matches: matches};
+    """, target_month, target_year)
+
+    if data.get('error'):
+        log.warning("Popup store error: %s", data['error'])
+        return result
+
+    log.info("Popup: %d rows, sevkTipi values: %s, matches: %d",
+             data.get('count', 0), data.get('sevkTipiValues', {}), len(data.get('matches', [])))
+
+    matches = data.get('matches', [])
+    if matches:
+        m = matches[0]
+        log.info("  Yatış found: Birim=%s | Tarih=%s | Org=%s", m['birim'], m['tarih'], m['org'])
+        result = {"found": True, "birim": m['birim'], "tarih": m['tarih']}
 
     return result
 
@@ -416,15 +493,56 @@ def find_yatis_in_popup(driver) -> dict:
 # Close popup
 # ---------------------------------------------------------------------------
 
+def close_all_popups(driver):
+    """Close only Hasta Geçmişi windows and remove masks — preserves Poliklinik."""
+    driver.execute_script("""
+        try {
+            var wins = Ext.ComponentQuery.query('window{isVisible()}');
+            for (var i = wins.length - 1; i >= 0; i--) {
+                var t = wins[i].title || '';
+                if (t.indexOf('Hasta Ge') !== -1 || t.indexOf('Birim') !== -1) {
+                    try { wins[i].close(); } catch(e) {}
+                }
+            }
+        } catch(e) {}
+        // Remove any leftover masks
+        document.querySelectorAll('.x-mask').forEach(function(m) { m.remove(); });
+    """)
+    time.sleep(1)
+
+
 def close_gecmis_popup(driver):
-    try:
-        wait_clickable(driver, By.XPATH, SEL.GECMIS_POPUP_CLOSE, timeout=5).click()
-        # Wait for popup to disappear
-        WebDriverWait(driver, 5).until(
-            EC.invisibility_of_element_located((By.XPATH, SEL.GECMIS_POPUP))
-        )
-    except TimeoutException:
-        log.warning("Could not close Hasta Geçmişi popup — continuing anyway.")
+    # Try closing via ExtJS first — targeted to Hasta Geçmişi window only
+    closed = driver.execute_script("""
+        try {
+            var wins = Ext.ComponentQuery.query('window{isVisible()}');
+            for (var i = wins.length - 1; i >= 0; i--) {
+                var t = wins[i].title || '';
+                if (t.indexOf('Hasta Ge') !== -1) {
+                    wins[i].close();
+                    return true;
+                }
+            }
+        } catch(e) {}
+        return false;
+    """)
+
+    if closed:
+        time.sleep(1)
+        log.info("Popup closed via ExtJS.")
+    else:
+        # Fallback: Escape key
+        try:
+            webdriver.ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(1)
+        except Exception:
+            pass
+        log.info("Popup closed via Escape fallback.")
+
+    # ALWAYS remove leftover masks — ExtJS close often leaves them behind
+    driver.execute_script("""
+        document.querySelectorAll('.x-mask').forEach(function(m) { m.remove(); });
+    """)
 
 # ---------------------------------------------------------------------------
 # Reset search
@@ -433,7 +551,8 @@ def close_gecmis_popup(driver):
 def reset_search(driver):
     """Clear Kriter Paneli so the next TC can be entered."""
     try:
-        wait_clickable(driver, By.XPATH, SEL.CLEAR_SEARCH_BUTTON, timeout=5).click()
+        btn = wait_clickable(driver, By.XPATH, SEL.CLEAR_SEARCH_BUTTON, timeout=5)
+        driver.execute_script("arguments[0].click();", btn)
     except TimeoutException:
         tc_input = safe_find(driver, By.XPATH, SEL.TC_SEARCH_INPUT)
         if tc_input:
@@ -451,7 +570,7 @@ def process_patient(driver, tc: str, transfer_dt: datetime) -> dict:
         return not_found
 
     try:
-        select_patient_row_by_date(driver, transfer_dt)
+        select_patient_row(driver)
     except RuntimeError as exc:
         log.warning("Could not select patient row: %s", exc)
         reset_search(driver)
@@ -460,13 +579,25 @@ def process_patient(driver, tc: str, transfer_dt: datetime) -> dict:
     open_hasta_gecmisi(driver)
     click_tum_hastaneler(driver)
 
-    info = find_yatis_in_popup(driver)
+    info = find_yatis_in_popup(driver, transfer_dt)
     close_gecmis_popup(driver)
     reset_search(driver)
 
     if info["found"]:
         return {"yatis_var": "Evet", "birim": info["birim"], "tarih": info["tarih"]}
     return no_yatis
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+def _poliklinik_is_alive(driver) -> bool:
+    """Return True if the Poliklinik search panel is currently visible."""
+    try:
+        els = driver.find_elements(By.XPATH, SEL.POLIKLINIK_LOADED_LANDMARK)
+        return bool(els) and els[0].is_displayed()
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # Main
@@ -490,6 +621,16 @@ def main():
 
         for idx, (row_idx, tc, transfer_dt) in enumerate(records, start=1):
             log.info("=== %d / %d | TC: %s ===", idx, len(records), tc)
+
+            # Ensure Poliklinik module is alive before each patient
+            if not _poliklinik_is_alive(driver):
+                log.warning("Poliklinik module lost — re-opening.")
+                try:
+                    open_poliklinik_module(driver)
+                except Exception:
+                    log.exception("Failed to re-open Poliklinik — aborting.")
+                    break
+
             try:
                 result = process_patient(driver, tc, transfer_dt)
                 write_result(ws, row_idx, col_map,
@@ -503,10 +644,111 @@ def main():
                 write_result(ws, row_idx, col_map,
                              yatis_var="HATA", birim="", tarih="")
                 wb.save(config.INPUT_FILE)
+                # Cleanup: close all popups/masks so next patient starts clean
+                close_all_popups(driver)
 
     finally:
         driver.quit()
-        log.info("Done.")
+        log.info("Scraping done.")
+
+    generate_report(ws, col_map)
+
+
+def generate_report(ws, col_map):
+    """Generate a clean report Excel with coloring and tally."""
+    from openpyxl.styles import PatternFill, Font, Alignment
+    from collections import Counter
+
+    log.info("Generating report: %s", config.OUTPUT_FILE)
+
+    out_wb = openpyxl.Workbook()
+    out_ws = out_wb.active
+    out_ws.title = "Sevk Raporu"
+
+    # Column indices in input sheet (1-based)
+    COL_ADI_SOYADI = 1        # A: ADI_SOYADI
+    COL_TARIH = 7             # G: TARIH
+    COL_TUMSEVKTANILARI = 8   # H: TUMSEVKTANILARI
+
+    # Styles
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    brown_fill = PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
+
+    # Write headers
+    headers = ["Tarih", "Hasta Adı", "Sevk Tanısı", "Yatış Var", "Birim"]
+    for c, h in enumerate(headers, 1):
+        cell = out_ws.cell(row=1, column=c, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    # Collect data and birim tally
+    birim_counter = Counter()
+    out_row = 2
+
+    for row_idx in range(config.DATA_START_ROW, ws.max_row + 1):
+        yatis_var = ws.cell(row=row_idx, column=col_map[config.COL_YATIS_VAR]).value
+        if yatis_var is None:
+            continue
+
+        tarih = ws.cell(row=row_idx, column=COL_TARIH).value
+        adi_soyadi = ws.cell(row=row_idx, column=COL_ADI_SOYADI).value
+        sevk_tanisi = ws.cell(row=row_idx, column=COL_TUMSEVKTANILARI).value
+        birim = ws.cell(row=row_idx, column=col_map[config.COL_BIRIM]).value or ""
+
+        # Format tarih
+        if isinstance(tarih, datetime):
+            tarih_str = tarih.strftime("%d.%m.%Y %H:%M")
+        else:
+            tarih_str = str(tarih) if tarih else ""
+
+        out_ws.cell(row=out_row, column=1, value=tarih_str)
+        out_ws.cell(row=out_row, column=2, value=adi_soyadi)
+        out_ws.cell(row=out_row, column=3, value=sevk_tanisi)
+        out_ws.cell(row=out_row, column=4, value=yatis_var)
+        out_ws.cell(row=out_row, column=5, value=birim)
+
+        # Color the row
+        if yatis_var == "Evet":
+            row_fill = green_fill
+            birim_counter[birim] += 1
+        elif yatis_var == "Hayır":
+            row_fill = brown_fill
+        else:
+            row_fill = None
+
+        if row_fill:
+            for c in range(1, 6):
+                out_ws.cell(row=out_row, column=c).fill = row_fill
+
+        out_row += 1
+
+    # Write tally to the right side
+    tally_col = 7  # Column G
+    tally_header = out_ws.cell(row=1, column=tally_col, value="Yatış Birimi")
+    tally_header.fill = header_fill
+    tally_header.font = header_font
+    count_header = out_ws.cell(row=1, column=tally_col + 1, value="Sayı")
+    count_header.fill = header_fill
+    count_header.font = header_font
+
+    for i, (birim, count) in enumerate(birim_counter.most_common(), start=2):
+        out_ws.cell(row=i, column=tally_col, value=birim)
+        out_ws.cell(row=i, column=tally_col + 1, value=count)
+
+    # Auto-width columns
+    for col in out_ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            if cell.value:
+                max_len = max(max_len, len(str(cell.value)))
+        out_ws.column_dimensions[col_letter].width = min(max_len + 2, 40)
+
+    out_wb.save(config.OUTPUT_FILE)
+    log.info("Report saved: %s", config.OUTPUT_FILE)
 
 
 if __name__ == "__main__":

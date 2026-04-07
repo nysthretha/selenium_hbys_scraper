@@ -76,7 +76,7 @@ KRITIK_STOK_HAYIR_BUTTON = "//a[.//span[normalize-space()='Hayır']]"
 
 # Confirmed: after opening the module, click the Poliklinik tab in the tab bar
 # to load the patient search panel (module renders empty without this click).
-POLIKLINIK_TAB = "//a[contains(@class,'x-tab') and contains(.,'Poliklinik')]"
+POLIKLINIK_TAB = "//a[contains(@class,'x-btn-toolbar') and not(contains(@class,'x-pressed')) and .//span[normalize-space()='Poliklinik']]"
 
 # Confirmed from Query P: tile text is in <span class="ux-desktop-shortcut-text">.
 # The click handler is on the parent element, so we navigate up with /..
@@ -146,10 +146,10 @@ HASTA_GECMISI_BUTTON = "//span[contains(@class,'goHistory16')]/ancestor::a[1]"
 #     w.innerText.includes('Hasta Geçmi') && w.style.display !== 'none')?.className)
 GECMIS_POPUP = "//div[contains(@class,'x-window') and not(contains(@style,'display: none')) and .//span[contains(text(),'Hasta Geçmi')]]"
 
-# "Tüm Hastaneler" toggle — confirmed type="button" input with class x-form-checkbox.
-# Selector is RELATIVE to the GECMIS_POPUP element (used via popup.find_element).
-# The label's `for` attribute uses a dynamic ext-comp-XXXX id so we anchor on the
-# label text instead and take the first following checkbox-style input.
+# "Tüm Hastaneler" toggle — label text is "Tüm Hastaneler:" (with colon), inside a
+# toolbar docked at the bottom of the popup grid. Clicked via JavaScript using the
+# label's `for` attribute to find the associated input — XPath scoping was unreliable.
+# This selector is kept for reference only; the actual click uses JS in scraper.py.
 TUM_HASTANELER_BUTTON = ".//label[contains(normalize-space(),'Tüm Hastaneler')]/following::input[@type='button' and contains(@class,'x-form-checkbox')][1]"
 
 # Individual row in the popup history grid.
