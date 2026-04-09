@@ -684,10 +684,8 @@ def generate_report(ws, col_map):
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
 
-    # Collect data and birim tally
-    birim_counter = Counter()
-    out_row = 2
-
+    # Collect all rows into a list for sorting
+    rows_data = []
     for row_idx in range(config.DATA_START_ROW, ws.max_row + 1):
         yatis_var = ws.cell(row=row_idx, column=col_map[config.COL_YATIS_VAR]).value
         if yatis_var is None:
@@ -698,24 +696,64 @@ def generate_report(ws, col_map):
         sevk_tanisi = ws.cell(row=row_idx, column=COL_TUMSEVKTANILARI).value
         birim = ws.cell(row=row_idx, column=col_map[config.COL_BIRIM]).value or ""
 
-        # Format tarih
+        # Parse tarih for sorting
         if isinstance(tarih, datetime):
+            sort_key = tarih
             tarih_str = tarih.strftime("%d.%m.%Y %H:%M")
+        elif isinstance(tarih, str):
+            sort_key = datetime.min
+            for fmt in ("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y"):
+                try:
+                    sort_key = datetime.strptime(tarih.strip(), fmt)
+                    break
+                except ValueError:
+                    continue
+            tarih_str = tarih
         else:
+            sort_key = datetime.min
             tarih_str = str(tarih) if tarih else ""
 
-        out_ws.cell(row=out_row, column=1, value=tarih_str)
-        out_ws.cell(row=out_row, column=2, value=adi_soyadi)
-        out_ws.cell(row=out_row, column=3, value=sevk_tanisi)
-        out_ws.cell(row=out_row, column=4, value=yatis_var)
-        out_ws.cell(row=out_row, column=5, value=birim)
+        rows_data.append({
+            "sort_key": sort_key,
+            "tarih_str": tarih_str,
+            "adi_soyadi": adi_soyadi,
+            "sevk_tanisi": sevk_tanisi,
+            "yatis_var": yatis_var,
+            "birim": birim,
+        })
 
-        # Color the row
-        if yatis_var == "Evet":
+    # Sort by transfer date ascending (earliest first)
+    rows_data.sort(key=lambda r: r["sort_key"])
+
+    # Write sorted rows and collect tallies
+    birim_counter = Counter()
+    total_count = 0
+    yatis_count = 0
+    hayir_count = 0
+    servis_count = 0
+    yogun_bakim_count = 0
+    out_row = 2
+
+    for r in rows_data:
+        total_count += 1
+        out_ws.cell(row=out_row, column=1, value=r["tarih_str"])
+        out_ws.cell(row=out_row, column=2, value=r["adi_soyadi"])
+        out_ws.cell(row=out_row, column=3, value=r["sevk_tanisi"])
+        out_ws.cell(row=out_row, column=4, value=r["yatis_var"])
+        out_ws.cell(row=out_row, column=5, value=r["birim"])
+
+        if r["yatis_var"] == "Evet":
             row_fill = green_fill
-            birim_counter[birim] += 1
-        elif yatis_var == "Hayır":
+            yatis_count += 1
+            birim_counter[r["birim"]] += 1
+            birim_upper = r["birim"].upper()
+            if "SERVIS" in birim_upper or "SERVİS" in birim_upper:
+                servis_count += 1
+            if "YOĞUN BAKIM" in birim_upper or "YOGUN BAKIM" in birim_upper:
+                yogun_bakim_count += 1
+        elif r["yatis_var"] == "Hayır":
             row_fill = brown_fill
+            hayir_count += 1
         else:
             row_fill = None
 
@@ -725,18 +763,50 @@ def generate_report(ws, col_map):
 
         out_row += 1
 
-    # Write tally to the right side
+    # --- Tally section on the right ---
     tally_col = 7  # Column G
-    tally_header = out_ws.cell(row=1, column=tally_col, value="Yatış Birimi")
-    tally_header.fill = header_fill
-    tally_header.font = header_font
-    count_header = out_ws.cell(row=1, column=tally_col + 1, value="Sayı")
-    count_header.fill = header_fill
-    count_header.font = header_font
+    bold_font = Font(bold=True)
 
-    for i, (birim, count) in enumerate(birim_counter.most_common(), start=2):
-        out_ws.cell(row=i, column=tally_col, value=birim)
-        out_ws.cell(row=i, column=tally_col + 1, value=count)
+    # Headers
+    for c, h in [(tally_col, "Yatış Birimi"), (tally_col + 1, "Sayı")]:
+        cell = out_ws.cell(row=1, column=c, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    # Birim breakdown
+    tally_row = 2
+    for birim, count in birim_counter.most_common():
+        out_ws.cell(row=tally_row, column=tally_col, value=birim)
+        out_ws.cell(row=tally_row, column=tally_col + 1, value=count)
+        tally_row += 1
+
+    # Separator + not-interned row
+    tally_row += 1
+    out_ws.cell(row=tally_row, column=tally_col, value="Yatış Yapılmayan").font = bold_font
+    out_ws.cell(row=tally_row, column=tally_col + 1, value=hayir_count).font = bold_font
+
+    # Summary statistics
+    tally_row += 2
+    pct = lambda n: f"%{(n / total_count * 100):.1f}" if total_count else "%0,0"
+
+    summary_rows = [
+        ("Toplam Sevk", total_count),
+        ("Toplam Yatış", yatis_count),
+        ("Yatış Oranı", pct(yatis_count)),
+        ("", ""),
+        ("Servis Yatışı", servis_count),
+        ("Servis Oranı", pct(servis_count)),
+        ("Yoğun Bakım Yatışı", yogun_bakim_count),
+        ("Yoğun Bakım Oranı", pct(yogun_bakim_count)),
+    ]
+    for label, value in summary_rows:
+        cell_l = out_ws.cell(row=tally_row, column=tally_col, value=label)
+        cell_v = out_ws.cell(row=tally_row, column=tally_col + 1, value=value)
+        if label:
+            cell_l.font = bold_font
+            cell_v.font = bold_font
+        tally_row += 1
 
     # Auto-width columns
     for col in out_ws.columns:
