@@ -35,3 +35,17 @@ WAIT_TIMEOUT = 40
 # Brief settle wait (seconds) after opening a visit detail — GWT fires async RPCs
 # after navigation; only used in one place, all other waits are WebDriverWait
 NAV_SETTLE_WAIT = 2
+
+# --- Yatış selection window (around the transfer timestamp) ---
+PRE_TRANSFER_GRACE_HOURS = 2
+# 24h cutoff reflects Turkish hospital operational norms — ED stays
+# >8h after diagnosis trigger administrative inquests, so admissions
+# resulting from a sevk realistically happen well within 24h.
+POST_TRANSFER_WINDOW_HOURS = 24
+
+# --- Tertiary center filter ---
+# Only Yatış rows whose birimOrganizasyon contains this substring count as
+# true positives (case-sensitive). "Araştırma" uniquely identifies the
+# Uşak Eğitim ve Araştırma Hastanesi among hospitals on this HBYS instance.
+# Set to "" to disable the filter entirely.
+TERTIARY_HOSPITAL_NAME = "Araştırma"
