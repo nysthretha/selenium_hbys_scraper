@@ -29,7 +29,7 @@ Prerequisites:
 import sys
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from selenium import webdriver
 from selenium.webdriver.common.action_chains import ActionChains
@@ -407,23 +407,23 @@ def click_tum_hastaneler(driver):
 # Scan popup rows for Yatış
 # ---------------------------------------------------------------------------
 
-def find_yatis_in_popup(driver, transfer_dt: datetime) -> dict:
+def find_yatis_in_popup(driver, tc: str, transfer_dt: datetime) -> dict:
     """
-    Scan all rows in the Hasta Geçmişi popup using the ExtJS grid store.
-    Look for a row where yatisTarihi is set (indicates internment) and falls
-    in the same month as the transfer date.
+    Scan all rows in the Hasta Geçmişi popup and return the EARLIEST row where:
+      (a) Sevk Tipi == "Yatış" (exact match after .strip())
+      (b) Sevk Tarihi within
+            [transfer_dt - PRE_TRANSFER_GRACE_HOURS, transfer_dt + POST_TRANSFER_WINDOW_HOURS]
+
+    Sevk Tipi and Sevk Tarihi are read as the rendered cell text (TD 9 / TD 8 per
+    locators.py); Birim is read from the store record (rec.data.birimAdi),
+    matching the prior extraction path.
+
     Returns {"found": bool, "birim": str, "tarih": str}.
     """
     result = {"found": False, "birim": "", "tarih": ""}
     wait_visible(driver, By.XPATH, SEL.GECMIS_POPUP)
 
-    target_month = transfer_dt.month
-    target_year  = transfer_dt.year
-
     data = driver.execute_script("""
-        var targetMonth = arguments[0];
-        var targetYear  = arguments[1];
-
         var wins = Ext.ComponentQuery.query('window');
         var popup = null;
         for (var i = 0; i < wins.length; i++) {
@@ -437,57 +437,68 @@ def find_yatis_in_popup(driver, transfer_dt: datetime) -> dict:
         var grids = popup.query('gridpanel');
         if (!grids.length) return {error: 'no grid in popup'};
 
-        var store = grids[0].getStore();
-        if (!store) return {error: 'no store'};
+        var grid  = grids[0];
+        var store = grid.getStore();
+        var view  = grid.getView();
+        if (!store || !view) return {error: 'no store/view'};
 
         var count = store.getCount();
-        var matches = [];
-        var sevkTipiValues = {};
-
+        var rows = [];
         for (var i = 0; i < count; i++) {
-            var rec = store.getAt(i);
-            var d = rec.data;
-            var st = String(d.sevkTipi || '');
-            sevkTipiValues[st] = (sevkTipiValues[st] || 0) + 1;
-
-            // sevkTipi '2' = Yatış (inpatient admission)
-            if (st !== '2') continue;
-
-            // Only consider records from the tertiary center
-            var org = String(d.birimOrganizasyon || '');
-            if (org.indexOf('Ara') === -1) continue;  // must contain "Araştırma"
-
-            // Parse sevkTarihi to check month
-            var sevkStr = String(d.sevkTarihi || '');
-            var sevkDate = new Date(sevkStr);
-            if (isNaN(sevkDate.getTime())) continue;
-
-            if (sevkDate.getMonth() + 1 === targetMonth && sevkDate.getFullYear() === targetYear) {
-                matches.push({
-                    birim: d.birimAdi || '',
-                    tarih: sevkDate.toLocaleDateString('tr-TR'),
-                    org: org
-                });
-            }
+            var rec  = store.getAt(i);
+            var node = view.getNode(rec);
+            if (!node) continue;  // not yet rendered (virtual scroll); skip
+            var tds = node.querySelectorAll('td');
+            if (tds.length < 12) continue;
+            // TD 8 = Sevk Tarihi, TD 9 = Sevk Tipi (1-based per locators.py)
+            rows.push({
+                sevkTarihi: (tds[7].innerText || '').trim(),
+                sevkTipi:   (tds[8].innerText || '').trim(),
+                birim:      (rec.data && rec.data.birimAdi) || '',
+                org:        (rec.data && rec.data.birimOrganizasyon) || ''
+            });
         }
-
-        return {count: count, sevkTipiValues: sevkTipiValues, matches: matches};
-    """, target_month, target_year)
+        return {count: count, rendered: rows.length, rows: rows};
+    """)
 
     if data.get('error'):
         log.warning("Popup store error: %s", data['error'])
         return result
 
-    log.info("Popup: %d rows, sevkTipi values: %s, matches: %d",
-             data.get('count', 0), data.get('sevkTipiValues', {}), len(data.get('matches', [])))
+    log.info("Popup: %d total / %d rendered rows",
+             data.get('count', 0), data.get('rendered', 0))
 
-    matches = data.get('matches', [])
-    if matches:
-        m = matches[0]
-        log.info("  Yatış found: Birim=%s | Tarih=%s | Org=%s", m['birim'], m['tarih'], m['org'])
-        result = {"found": True, "birim": m['birim'], "tarih": m['tarih']}
+    window_start = transfer_dt - timedelta(hours=config.PRE_TRANSFER_GRACE_HOURS)
+    window_end   = transfer_dt + timedelta(hours=config.POST_TRANSFER_WINDOW_HOURS)
 
-    return result
+    tertiary = config.TERTIARY_HOSPITAL_NAME
+    candidates = []
+    for row in data.get('rows', []):
+        if row['sevkTipi'].strip() != "Yatış":
+            continue
+        if tertiary and tertiary not in row['org']:
+            log.debug("Patient %s: Yatış at org=%r not tertiary, skipped.",
+                      tc, row['org'])
+            continue
+        raw_tarih = row['sevkTarihi'].strip()
+        try:
+            sevk_dt = datetime.strptime(raw_tarih, "%d.%m.%Y %H:%M")
+        except ValueError:
+            log.warning("Could not parse Sevk Tarihi: '%s' for TC %s", raw_tarih, tc)
+            continue
+        if window_start <= sevk_dt <= window_end:
+            candidates.append((sevk_dt, row['birim']))
+        else:
+            log.debug("Patient %s: Yatış at %s outside window, skipped.", tc, sevk_dt)
+
+    if not candidates:
+        return result
+
+    candidates.sort(key=lambda x: x[0])
+    sevk_dt, birim = candidates[0]
+    tarih_str = sevk_dt.strftime("%d.%m.%Y %H:%M")
+    log.info("  Yatış selected: Birim=%s | Tarih=%s", birim, tarih_str)
+    return {"found": True, "birim": birim, "tarih": tarih_str}
 
 # ---------------------------------------------------------------------------
 # Close popup
@@ -579,7 +590,7 @@ def process_patient(driver, tc: str, transfer_dt: datetime) -> dict:
     open_hasta_gecmisi(driver)
     click_tum_hastaneler(driver)
 
-    info = find_yatis_in_popup(driver, transfer_dt)
+    info = find_yatis_in_popup(driver, tc, transfer_dt)
     close_gecmis_popup(driver)
     reset_search(driver)
 
@@ -621,6 +632,16 @@ def main():
 
         for idx, (row_idx, tc, transfer_dt) in enumerate(records, start=1):
             log.info("=== %d / %d | TC: %s ===", idx, len(records), tc)
+
+            if not isinstance(transfer_dt, datetime):
+                log.error(
+                    "Row %d (TC %s): TARIH is %r (type %s) — marking HATA",
+                    row_idx, tc, transfer_dt, type(transfer_dt).__name__,
+                )
+                write_result(ws, row_idx, col_map,
+                             yatis_var="HATA", birim="", tarih="")
+                wb.save(config.INPUT_FILE)
+                continue
 
             # Ensure Poliklinik module is alive before each patient
             if not _poliklinik_is_alive(driver):

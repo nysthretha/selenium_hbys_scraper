@@ -78,6 +78,8 @@ HBYS_PASSWORD=SIFRENIZ
 | G | TARIH |
 | H | TUMSEVKTANILARI |
 
+> **Önemli:** Girdi dosyası **`.xlsx`** (modern Excel) formatında olmalıdır. JasperReports vb. araçlar genellikle eski `.xls` formatında dışa aktarır; bu dosyayı Excel'de açıp **Farklı Kaydet → Excel Çalışma Kitabı (`.xlsx`)** olarak yeniden kaydedin. `G` sütunundaki `TARIH` hücresi gerçek bir Excel tarihi olmalıdır (düz metin değil); aksi hâlde ilgili satır `HATA` olarak işaretlenir.
+
 ### 5. Otomasyonu Çalıştırın
 
 PowerShell'de:
@@ -112,6 +114,26 @@ Windows Gezgini adres çubuğuna yukarıdaki yolu yapıştırarak dosyayı açab
 
 Sağ tarafta (G-H sütunları) birim bazlı yatış özeti yer alır.
 
+## Yatış Eşleştirme Kuralları
+
+Bir sevk satırı için "Yatış Var = Evet" sayılabilmesi şu **üç şartın da** birlikte sağlanmasına bağlıdır:
+
+1. **Sevk Tipi** Hasta Geçmişi penceresinde tam olarak `Yatış` (boşluklar kırpıldıktan sonra eşit) olmalı.
+2. **Birim Organizasyon** alanı `TERTIARY_HOSPITAL_NAME` (varsayılan: `Araştırma`) alt dizesini içermeli — yani üst merkezdeki bir yatış olmalı.
+3. **Sevk Tarihi**, sevk zamanına göre `[sevk − PRE_TRANSFER_GRACE_HOURS, sevk + POST_TRANSFER_WINDOW_HOURS]` aralığına düşmeli (varsayılan: 2 saat öncesi – 24 saat sonrası).
+
+Birden fazla satır bu üç şartı sağlarsa **kronolojik olarak en erken** olan kayıt seçilir; bu sayede yıllar önceki ilgisiz yatışlar mevcut sevkin sonucu gibi raporlanmaz.
+
+İlgili ayarlar `config.py` içindedir:
+
+```python
+PRE_TRANSFER_GRACE_HOURS   = 2
+POST_TRANSFER_WINDOW_HOURS = 24
+TERTIARY_HOSPITAL_NAME     = "Araştırma"   # boş bırakılırsa filtre devre dışı
+```
+
+`config.py` dosyasındaki `TERTIARY_HOSPITAL_NAME` üst merkezi tanımlayan benzersiz bir alt dize olmalıdır. Filtre eşleşmiyorsa, bu değişkeni `""` yaparak filtreyi geçici olarak kapatabilir, çıktıdaki gerçek `birimOrganizasyon` metnine göre yeniden uygun bir alt dize seçebilirsiniz.
+
 ## Sık Karşılaşılan Sorunlar
 
 | Sorun | Çözüm |
@@ -121,3 +143,6 @@ Sağ tarafta (G-H sütunları) birim bazlı yatış özeti yer alır.
 | Sayfa yüklenmiyor / timeout | Hastane ağına bağlı olduğunuzdan emin olun. Ağ yavaşsa `config.py` içinde `WAIT_TIMEOUT` değerini artırın. |
 | İlk hasta bulunamıyor | Sistem yavaş olabilir. `config.py` içinde `WAIT_TIMEOUT` değerini 60'a çıkarın. |
 | Tüm sonuçlar HATA | Tarayıcı penceresi kapatılmış veya HBYS oturumu düşmüş olabilir. Tekrar çalıştırın. |
+| `FileNotFoundError: input.xlsx` | Girdi dosyası `.xls` (eski format) olabilir. Excel'de açıp `.xlsx` olarak yeniden kaydedin. |
+| Sadece bazı satırlar HATA | İlgili satırların `G` sütunundaki `TARIH` hücresi metin veya boş olabilir. Hücreyi gerçek bir tarih biçimine çevirin. |
+| Yatış olduğu kesin ama Hayır olarak işaretleniyor | İki olası sebep: (a) yatış, sevk zamanından 24 saatten fazla sonra yapılmış — `POST_TRANSFER_WINDOW_HOURS` değerini artırın; (b) `birimOrganizasyon` alanında `Araştırma` alt dizesi yok — `TERTIARY_HOSPITAL_NAME` değerini güncelleyin. |
